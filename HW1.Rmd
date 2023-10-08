@@ -1,0 +1,797 @@
+---
+title: "DATA 622 HW1"
+author: "Josh Iden"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::readthedown:
+    code_folding: show
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This assignment explores and compares the structure and contents of two datasets from <https://excelbianalytics.com/wp/downloads-18-sample-csv-files-data-sets-for-testing-sales/>, considers their similarities and differences, and explores how to analyze and predict an outcome based on the data.
+
+We will use the following packages for this study,
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(ipred)
+library(corrplot)
+library(forecast)
+library(randomForest)
+library(ggthemes)
+library(egg)
+library(kableExtra)
+library(doParallel)
+```
+
+# The Data
+
+## Overview {.tabset}
+
+### Dataset 1: 100 Sales Records
+
+```{r data.100_setup}
+data.100 <- read.csv('/Users/joshiden/Documents/Classes/CUNY SPS/Fall 2023/DATA622/HW1/100 Sales Records.csv')
+glimpse(data.100)
+```
+
+The dataset consists of:
+
+-   100 rows of data across 14 columns.\
+-   7 continuous variables.\
+-   7 variables in string (character) format.
+    -   4 categorical variables: `Region`, `Country`, `Item.Type`, `Sales.Channel.`\
+    -   1 ordinal variable: `Order.Priority.`, with no order given.\
+    -   2 date variables: `Order.Date`, `Ship.Date.`
+
+We convert categorical, except for `Country`, which contains 76 unique values, and ordinal variables to factors and date variables to dates,
+
+```{r data.100_clean1}
+data.100 <- data.100 |>
+  mutate(Region = as.factor(Region),
+         Item.Type = as.factor(Item.Type),
+         Sales.Channel = as.factor(Sales.Channel),
+         Order.Priority = as.factor(Order.Priority),
+         Order.Date = as.Date(Order.Date, format = "%m/%d/%Y"),
+         Ship.Date = as.Date(Ship.Date, format = "%m/%d/%Y"))
+
+colnames(data.100) <- tolower(colnames(data.100))
+```
+
+We check for any missing values; there are none,
+
+```{r data.100_NAs}
+colSums(is.na(data.100))
+```
+
+Now we can view summary statistics for each variable,
+
+```{r data.100_summary}
+summary(data.100)
+```
+
+We can view the shape of the numeric data,
+
+```{r}
+data.100 |>
+  select(where(is.numeric) & -order.id) |>
+  gather() |>
+  ggplot(aes(x = key, y = value)) +
+  geom_boxplot() + 
+  labs(x = "", y = "", title = "Distribution of Numerical Variables") +
+  theme_few() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(~ key, scales = "free")
+```
+
+The only numeric variable that appears to be symmetrical is `Units.Sold`. Let's take a look at the categorical variables.
+
+```{r}
+data.100 |>
+  select(item.type, order.priority, region) |>
+  gather() |>
+  ggplot(aes(x = value)) +
+  geom_bar(fill='lightblue') +
+  facet_wrap(~ key, scales = "free") + 
+  theme_few() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x='',
+       y='',
+       title='distribution of categorical variables')
+```
+
+We know the `Sales.Channel` variable is an even 50/50 split from the summary statistics. What we can see here is that `Order.Priority` is relatively symmetrical, while the other categorical variables are not.
+
+```{r data.100_lineplot, cache=TRUE}
+data.100 |>
+  select(order.date, total.revenue, region) |>
+  ggplot(aes(x = order.date, y = total.revenue, color=region)) +
+  geom_line() +
+  labs(x = 'Date',
+       y = 'Total Revenue',
+       title = 'Total Revenue by Region: 2010-2017') +
+  theme_few()
+```
+
+Let's take a look at the correlation amongst the numeric variables,
+
+```{r}
+data.100 |>
+  select(where(is.numeric), -order.id) |>
+  cor() |>
+  corrplot(type = "upper")
+```
+
+We see there is high correlation amongst all numerical variables *except* `Unit.Cost` and `Unit.Price` to `Units.Sold`.
+
+Let's take a look at the total profit by sales channel,
+
+```{r data.100_profitsales, cache=TRUE}
+p1 <- data.100 |>
+  select(sales.channel, region, total.profit) |>
+  ggplot(aes(x=region, y=total.profit, fill=sales.channel)) +
+  geom_bar(stat = "identity") +
+  labs(x = "",
+       y = "",
+       fill = "",
+       title = "Profit by Channel") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette="YlGnBu")
+
+p2 <- data.100 |>  
+  select(sales.channel, region, units.sold) |>
+  ggplot(aes(x=region, y=units.sold, fill=sales.channel)) +
+  geom_bar(stat = "identity") +
+  labs(x = "",
+       y = "",
+       fill = "",
+       title = "Sales by Channel") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette="YlGnBu")
+
+ggarrange(p1, p2, ncol=2)
+```
+
+Let's take a look at the profitability distribution by Order Priority:
+
+```{r}
+data.100 |>
+  group_by(order.priority) |>
+  summarise(avg.profit = mean(total.profit)) |>
+  ggplot(aes(x=order.priority, y=avg.profit)) +
+  geom_bar(stat='identity', fill='lightblue') +
+  geom_text(aes(label = paste0('$',round(avg.profit))), vjust = 2, size = 4) +
+  labs(x='',
+       y='',
+       title='avg profit per order by priority') +
+  theme_few() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),  # Remove y-axis text
+        axis.ticks.y = element_blank())
+```
+
+What is the average turnaround time for the priority levels? To calculate this, we create a new variable `turn` that represents the time between `order.date` and `ship.date`
+
+```{r data100turn}
+data.100 <- data.100 |>
+  mutate(turn = as.integer(ship.date - order.date))
+```
+
+```{r}
+data.100 |>
+  group_by(order.priority) |>
+  summarise(total.orders = n(),
+            total.units = sum(units.sold),
+            avg.turn = round(mean(turn)),
+            avg.profit = mean(total.profit)) |>
+  arrange(desc(avg.profit)) |>
+  kable() |>
+  kable_styling()
+```
+
+```{r}
+data.100 |>
+  ggplot(aes(x=order.priority, y=turn)) +
+  geom_boxplot(fill='lightblue') +
+  labs(x='priority',
+       y='days',
+       title='turnaround time by order priority') +
+  theme_few() +
+  theme(plot.title = element_text(hjust=0.5))
+```
+
+We see that 30% of all orders are priority level "H", these orders ship 3-4 days faster than the other levels, and the average profit of these orders is $10-15k higher than levels "M" and "L" and nearly twice as high as level "C". 
+
+Is there a relationship between the number of items per order and the turnaround time? 
+
+```{r}
+data.100 |>
+  ggplot(aes(x=units.sold, y=turn, color=order.priority)) +
+  geom_point() +
+  labs(x='units',
+       y='days',
+       title = 'turnaround time by units sold') +
+  theme_few() +
+  theme(plot.title = element_text(hjust=0.5)) +
+  facet_wrap(~ region, scales="free")
+```
+
+It's just white noise. 
+
+Does the profitability of the items affect turnaround time? 
+
+```{r}
+data.100 |>
+  ggplot(aes(x=total.profit, y=turn)) +
+  geom_point(color='lightblue', alpha=0.8) +
+  facet_wrap(~ region, scales="free")  +
+  labs(x='profit',
+       y='days',
+       title = 'turnaround time by order profit') +
+  theme_few() +
+  theme(plot.title = element_text(hjust=0.5)) +
+  facet_wrap(~ region, scales="free")
+```
+
+There does not appear to be a relationship. 
+
+Lastly, let's take a look at profitability by item type to see if we can observe any patterns. We'll look at an overview of all orders and then drill down by region, 
+
+```{r data100profitboxes, fig.height=10, cache=TRUE}
+p1 <- data.100 |>
+  ggplot(aes(x=total.profit, y=item.type)) +
+  geom_boxplot(fill='lightblue') + 
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) +
+  labs(x="",
+       y="",
+       title="profit by item type")
+
+
+p2 <- data.100 |>
+  ggplot(aes(x=total.profit, y=item.type, fill=region)) +
+  geom_boxplot() + 
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) +
+  labs(x="",
+       y="",
+       title="",
+       fill="")
+
+ggarrange(p1, p2, nrow=2)
+```
+We can see that Household and Cosmetics items have the highest overall median profits, but there is some variance by region. 
+
+```{r}
+data.100 |>
+  group_by(region, item.type) |>
+  summarise(total.profit = sum(total.profit)) |>
+  top_n(2, wt = total.profit) |>
+  arrange(region, desc(total.profit)) |>
+  kable() |>
+  kable_styling()
+```
+
+
+### Dataset 2: 100,000 Sales Records
+
+```{r data.100k_setup}
+data.100k <- read.csv('/Users/joshiden/Documents/Classes/CUNY SPS/Fall 2023/DATA622/HW1/100000 Sales Records.csv')
+glimpse(data.100k)
+```
+
+The dataset consists of:
+
+-   100,000 rows of data across 14 columns.\
+-   7 continuous variables.\
+-   7 variables in string (character) format.
+    -   4 categorical variables: `Region`, `Country`, `Item.Type`, `Sales.Channel.`\
+    -   1 ordinal variable: `Order.Priority.`, with no order given.\
+    -   2 date variables: `Order.Date`, `Ship.Date.`
+
+We convert categorical, except for `Country`, which contains 185 unique values, and ordinal variables to factors and date variables to dates,
+
+```{r data.100k_clean1}
+data.100k <- data.100k |>
+  mutate(Region = as.factor(Region),
+         Item.Type = as.factor(Item.Type),
+         Sales.Channel = as.factor(Sales.Channel),
+         Order.Priority = as.factor(Order.Priority),
+         Order.Date = as.Date(Order.Date, format = "%m/%d/%Y"),
+         Ship.Date = as.Date(Ship.Date, format = "%m/%d/%Y"))
+
+colnames(data.100k) <- tolower(colnames(data.100k))
+```
+
+We check for NAs, none.
+
+```{r data.100k_NAs}
+colSums(is.na(data.100k))
+```
+
+And we can view some summary statistics,
+
+```{r data.100k_summary}
+summary(data.100k)
+```
+
+```{r data.100k_distplots, cache=TRUE}
+data.100k |>
+  select(where(is.numeric) & -order.id) |>
+  gather() |>
+  ggplot(aes(x = key, y = value)) +
+  geom_boxplot() + 
+  labs(x = "", y = "", title = "Distribution of Numerical Variables") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(~ key, scales = "free")
+```
+
+```{r data.100k_distplots2, cache=TRUE}
+data.100k |>
+  select(item.type, order.priority, region) |>
+  gather() |>
+  ggplot(aes(x = value)) +
+  geom_bar(fill='lightblue') +
+  facet_wrap(~ key, scales = "free") + 
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) +
+  labs(x = "",
+       y = "",
+       title = "Distribution of Categorical Variables")
+```
+
+We can see that although the distribution amongst regions is highly variant, the `Item.Type`s and `Order.Priority`s are uniformly distributed amongst categories.
+
+```{r data.100k_lineplot, cache=TRUE}
+data.100k |>
+  select(order.date, total.revenue, region) |>
+  ggplot(aes(x = order.date, y = total.revenue, color=region)) +
+  geom_line() +
+  labs(x = 'Date',
+       y = 'Total Revenue',
+       title = 'Total Revenue by Region: 2010-2017')
+```
+
+We can see that the data is so granular and variant that we'd either need to expand our plot dramatically or group the data by month (losing some information along the way) in order to visualize it. Zooming in on a single month illustrates this:
+
+```{r data.100k_lineplot2, cache=TRUE}
+data.100k |>
+  select(order.date, total.revenue, region) |>
+  filter(order.date <= min(order.date + 29)) |>
+  ggplot(aes(x = order.date, y = total.revenue, color=region)) +
+  geom_line() +
+  labs(x = 'Date',
+       y = 'Total Revenue',
+       title = 'Total Revenue by Region: January 2010')
+```
+
+We can see the high variance among the daily revenue.
+
+Let's take a look at the correlation between the numeric variables,
+
+```{r}
+data.100k |>
+  select(where(is.numeric), -order.id) |>
+  cor() |>
+  corrplot(type = "upper")
+```
+
+Again, the only variables that do not exhibit strong correlation are `Unit.Price` and `Unit.Cost` to `Units.Sold`.
+
+```{r data.100k_profit_channel, cache=TRUE}
+d1 <- data.100k |>
+  select(sales.channel, total.profit, region) |>
+  ggplot(aes(x=region, y=total.profit, fill=sales.channel)) +
+  geom_bar(stat = "identity") +
+  labs(x = "",
+       y = "",
+       fill = "",
+       title = "Profit") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette="YlGnBu")
+
+d2 <- data.100k |>  
+  select(sales.channel, region, units.sold) |>
+  ggplot(aes(x=region, y=units.sold, fill=sales.channel)) +
+  geom_bar(stat = "identity") +
+  labs(x = "",
+       y = "",
+       fill = "",
+       title = "Sales") +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette="YlGnBu")
+
+ggarrange(d1, d2, ncol=2)
+```
+
+Let's take a look at the profitability distribution by Order Priority:
+
+```{r}
+data.100k |>
+  group_by(order.priority) |>
+  summarise(avg.profit = mean(total.profit)) |>
+  ggplot(aes(x=order.priority, y=avg.profit)) +
+  geom_bar(stat='identity', fill='lightblue') +
+  geom_text(aes(label = paste0('$',round(avg.profit))), vjust = 2, size = 4) +
+  labs(x='',
+       y='',
+       title='avg profit per order by priority') +
+  theme_few() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),  # Remove y-axis text
+        axis.ticks.y = element_blank())
+```
+For this dataset, the profit by priority is comparable amongst all levels. Let's take a look at the turnaround time by priority level. 
+
+```{r data100kturn}
+data.100k <- data.100k |>
+  mutate(turn = as.integer(ship.date - order.date))
+```
+
+```{r data100kturn_table}
+data.100k |>
+  group_by(order.priority) |>
+  summarise(total.orders = n(),
+            avg.order = round(mean(units.sold)),
+            avg.turn = round(mean(turn)),
+            avg.profit = mean(total.profit)) |>
+  arrange(desc(avg.profit)) |>
+  kable() |>
+  kable_styling()
+```
+
+```{r}
+data.100k |>
+  ggplot(aes(x=order.priority, y=turn)) +
+  geom_boxplot(fill='lightblue') +
+  labs(x='priority',
+       y='days',
+       title='turnaround time by order priority') +
+  theme_few() +
+  theme(plot.title = element_text(hjust=0.5))
+```
+
+For this dataset, the average turnaround time and average profit is equal amongst all the different priority levels, although the profit level is marginally higher for the "H" and "C" priority levels. 
+
+Lastly, let's take a look at profitability by item type to see if we can observe any patterns. We'll look at an overview of all orders and then drill down by region, 
+
+```{r data100kprofitboxes, fig.height=10, cache=TRUE}
+p1 <- data.100k |>
+  ggplot(aes(x=total.profit, y=item.type)) +
+  geom_boxplot(fill='lightblue') + 
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) +
+  labs(x="",
+       y="",
+       title="profit by item type")
+
+
+p2 <- data.100k |>
+  ggplot(aes(x=total.profit, y=item.type, fill=region)) +
+  geom_boxplot() + 
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5)) +
+  labs(x="",
+       y="",
+       title="",
+       fill="")
+
+ggarrange(p1, p2, nrow=2)
+```
+
+We can see for this dataset that the regions have no bearing on the distribution of profit by item type.
+
+```{r}
+data.100k |> 
+  group_by(sales.channel, order.priority) |> 
+  summarise(total.orders = n(), 
+            total.sold = sum(units.sold),
+            avg.turn = mean(turn))
+```
+
+Is there a relationship between the number of items per order and the turnaround time? 
+
+```{r}
+data.100k |>
+  ggplot(aes(x=units.sold, y=turn, color=order.priority)) +
+  geom_point() +
+  labs(x='units',
+       y='days',
+       title = 'turnaround time by units sold') +
+  theme_few() +
+  theme(plot.title = element_text(hjust=0.5)) +
+  facet_wrap(~ region, scales="free")
+```
+
+It's just white noise, there is too much data to visualize. But there do not appear to be any patterns. 
+
+Does the profitability of the items affect turnaround time? 
+
+```{r}
+data.100k |>
+  ggplot(aes(x=total.profit, y=turn)) +
+  geom_point(color='lightblue', alpha=0.8) +
+  facet_wrap(~ region, scales="free")  +
+  labs(x='profit',
+       y='days',
+       title = 'turnaround time by order profit') +
+  theme_few() +
+  theme(plot.title = element_text(hjust=0.5)) +
+  facet_wrap(~ region, scales="free")
+```
+
+Again, it's too much data to visualize, but we don't see any patterns whatsoever.  
+
+```{r}
+data.100k |>
+  group_by(region, item.type, sales.channel) |>
+  summarise(total.sold = sum(units.sold)) |>
+  ggplot(aes(x=item.type, y=total.sold, fill=sales.channel)) +
+  geom_bar(stat='identity', position=position_dodge()) +
+  facet_wrap(~region, scales="free") +
+  labs(x='',
+       y='sold',
+       title='total sales by region',
+       fill='') +
+  theme_few() +
+  theme(axis.text.x = element_text(angle = 45, hjust=1),
+        plot.title = element_text(hjust=0.5)) +
+  scale_fill_brewer(palette="YlGnBu")
+```
+We can see that certain products have sell better online or offline in different regions. 
+
+## Comparing the Data
+
+Both datasets contain observations about inventory sold by date around the world (mostly outside North America) consisting of a mix of categorical and continuous variables. Both datasets exhibit high variance and non-normal distribution amongst the variables. We can observe the following dependencies across both datasets:
+
+`total.cost` is a function `units.sold` \* `unit.cost` `total.profit` is a function `total.revenue` - `total.cost`.   
+`total.revenue` is a function `unit.cost` x `units.sold`.   
+
+We can observe that both datasets contain roughly equal distribution of online and offline sales, but the total number of items sold and the total profit from those sales is much higher for offline sales than online. There are no missing values in either dataset.
+
+# Model Selection
+
+The guiding question at this point in the analysis is, what do we want to predict? Considering the data, there are a few things we can look at:
+
+-   Predicting Sales Channel.\
+-   Predicting Order Priority.\
+-   Predicting Total Profit.
+
+Considering these three options with the data that is available, I wonder if any of these three serve realistic business goals, based upon the available data. For example, if we are given all of the data except sales channel, ie, we know how many of each item type are sold, what value is it to know after the fact whether an order is sold online or offline, or what the order priority is? Along the same lines, how beneficial is it to predict profit given sales totals? That is simple mathematics. With these thoughts in mind, the question to me becomes, how can we predict the total number of items sold by item type if given all the additional information in the dataset? Predicting the numbers of items sold would provide valuable business use regarding pricing and inventory allocation, ie how many items to make available online vs. offline, or perhaps offering a lower price for online sales.
+
+Considering that both datasets contain a mix of categorical and continuous variables, have non-normal distributions, and have unequal variance, I will attempt to model two decision trees on these data to try to predict `Units.Sold` as the outcome variable.
+
+## Feature Selection.
+
+Considering that both datasets contain a mix of categorical and continuous variables, have non-normal distributions, and have unequal variance, and that most of the continous variables are dependent on one another, I am going to build decision trees to predict the total sold per item given the following variables:
+
+`Month`.\
+`Year`.\
+`Region`.\
+`Country`.\
+`Item.Type`.\
+`Unit.Price`.\
+`Sales.Channel`.
+
+First, we need to extract the `Month` variable from the `Order.Date` in each dataset,
+
+```{r month, cache=TRUE}
+d100 <- data.100 |>
+  mutate(month = factor(month(order.date, label=TRUE)),
+         year = year(order.date),
+         price = unit.price,
+         item = item.type,
+         channel = sales.channel,
+         sold = units.sold) |>
+  select(sold, item, price, month, year, region, channel) 
+
+d100k <- data.100k |>
+  mutate(month = factor(month(order.date, label=TRUE)),
+         year = year(order.date),
+         price = unit.price,
+         item = item.type,
+         channel = sales.channel,
+         sold = units.sold) |>
+  select(sold, item, price, month, year, region, channel)
+```
+
+Previewing our datasets looks like this:
+
+Dataset 1:
+
+```{r}
+kable(head(d100))
+```
+
+Dataset 2:
+
+```{r}
+kable(head(d100k))
+```
+
+# Data Modeling
+
+We are going to use Random Forest and Bagged Trees to generate predictions about total number of items sold on each dataset. First we split each set training and testing sets using an 80/20 split.
+
+```{r data_split, cache=TRUE}
+set.seed(1)
+
+# set split indices
+split.d100 <- createDataPartition(d100$sold, p = .8, list = FALSE)
+split.d100k<- createDataPartition(d100k$sold, p = .8, list = FALSE)
+
+# split data and partition predictor (x) and response (y) sets
+
+# dataset1
+train.d100 <- d100[split.d100, ]
+test.d100 <- d100[-split.d100, ]
+
+# dataset2
+train.d100k <- d100k[split.d100k, ]
+test.d100k <- d100k[-split.d100k, ]
+```
+
+We set up our cross-validation parameters. Since the dataset 1 training data is only 80 observations, we choose Leave-One-Out cross-validation. For the larger dataset, we will use 10-fold cross-validation.
+
+```{r}
+loocv <- trainControl(
+  method = "LOOCV",
+  allowParallel = TRUE
+)
+
+cv <- trainControl(
+  method = "cv",
+  number = 5,
+  allowParallel = TRUE
+)
+```
+
+We define a function to return the prediction metrics, including Mean Absolute Percentage Error (MAPE):
+
+```{r}
+metrics <- function(predicted, actual){
+  mape = accuracy(predicted, actual)['Test set','MAPE']
+  measures = postResample(predicted, actual) 
+  metrics = c(measures, MAPE=mape)
+  return(metrics)
+}
+```
+
+## Selecting a Model {.tabset}
+
+First we prepare additional cores for parallel processing, 
+
+```{r}
+num_cores <- 4
+cl <- makeCluster(num_cores)
+```
+
+
+### Random Forest
+
+**Dataset 1**
+
+```{r rf100, cache=TRUE}
+registerDoParallel(cl)
+set.seed(1)
+
+rf100 <- randomForest(sold ~ ., 
+                      data = train.d100,
+                      importance = TRUE,
+                      trControl = loocv,
+                      ntree = 1000,
+                      parallel = "multicore")
+
+rf100.preds <- predict(rf100, test.d100)
+rf100.results <- metrics(rf100.preds, test.d100$sold)
+```
+
+```{r}
+rf100
+```
+
+
+**Dataset 2**
+
+```{r rf100k, cache=TRUE}
+set.seed(1)
+
+rf100k <- randomForest(sold ~ ., 
+                       data = train.d100k,
+                       importance = TRUE,
+                       ntree = 10,
+                       mtry = sqrt(length(colnames(train.d100k))-1),
+                       trControl = cv,
+                       parallel = "multicore")
+
+rf100k.preds <- predict(rf100k, test.d100k)
+rf100k.results <- metrics(rf100k.preds, test.d100k$sold)
+```
+
+```{r}
+rf100k
+```
+
+### Bagged Trees
+
+**Dataset 1**    
+
+```{r bagged100, cache=TRUE}
+set.seed(1)
+
+bagged100 <- train(sold ~ .,
+                   data = train.d100,
+                   method = "treebag",
+                   trControl = loocv,
+                   tuneLength = 10)
+
+bagged100.preds <- predict(bagged100, test.d100)
+bagged100.results <- metrics(bagged100.preds, test.d100$sold)
+```
+
+```{r}
+bagged100
+```
+
+
+**Dataset 2**   
+
+```{r bagged100k, cache=TRUE}
+set.seed(1)
+
+bagged100k <- train(sold ~ .,
+                    data = train.d100k,
+                    method = "treebag",
+                    trControl = cv,
+                    tuneLength = 10)
+
+bagged100k.preds <- predict(bagged100k, test.d100k)
+bagged100k.results <- metrics(bagged100k.preds, test.d100k$sold)
+```
+
+```{r}
+bagged100k
+```
+
+
+## Results    
+
+```{r}
+kable(rbind("Dataset 1: Random Forest" = rf100.results,
+      "Dataset 1: Bagged Trees" = bagged100.results,
+      "Dataset 2: Random Forest" = rf100k.results,
+      "Dataset 2: Bagged Trees" = bagged100k.results)) |> kable_styling()
+```
+
+Neither model for either dataset is able to predict the number sold based on the chosen variables. The Mean Absolute Percentage Error (MAPE) values indicate the model's predictive accuracy is off by 257% to 501% -- those are unacceptably poor results. 
+
+# Discussion / Essay   
+
+In this study we looked at two datasets from [Excel Bianalytics](https://excelbianalytics.com/wp/downloads-18-sample-csv-files-data-sets-for-testing-sales/), containing worldwide sales data for the years 2010-2017. We looked at two different sized datasets to identify a business problem and compare the performance of two machine learning algorithms on the datasets. The first dataset is small, consisting of 100 observations. The second dataset is large, containing 100,000 observations. The observations are a mix of 14 categorical, continuous, and date variables, as well as an order ID that does not serve a use for modeling. The 13 remaining variables are region, country, item type, sales channel, order priority, order date, ship date, units sold, unit price, unit cost, total revenue, total cost, and total profit. We determined that dependencies exist between total profit (total revenue - total cost), total cost (units sold x unit cost), and total revenue (units sold x unit price). As such, these three variables exhibited high correlation with their dependence variables and decided to focus on predicting units sold as our outcome variable, since cost, revenue, and profit can all be derived from the units sold. This seemed the most sensible business use to focus our attention on. This left us with the following 9 variables: region, country, item type, sales channel, order priority, order date, ship date, units sold. We calculated the processing time for each order as the difference between the order date and ship date. We also determined that the number of distinct countries was too large to be of use for our modeling: dataset 1 containing 100 observations: 76 different countries; dataset 2, 100k observations: 185 different countries. 
+
+After feature engineering and selection we had 7 predictor variables. We conducted exploratory data analysis and observed that the categorical predictors in the smaller dataset were unevenly distributed, while in the larger dataset, they were uniform. We observed no noticeable trend over time in either dataset. We further observed no linearity between the predictors and the outcome variable, and we determined that the processing time variable that we created did not appear to have any relationship with either the predictors or outcome variable. 
+
+As the datasets contained a combination of categorical and continuous variables we decided to employ decision tree models to predict the number of items sold. Decision trees are able to handle mixed data types and don't require strong assumptions about variable distributions. They are also able to be employed for datasets of different sizes. However, they can be prone to overfitting and bias. To reduce this, we used the ensemble methods Bagged Trees and Random Forests. The bagged trees ("B"ootstrap "Agg"regation) model reduces the variance of a model by averaging the predictions of multiple decision trees, taking bootstrap samples (sampling with replacement) of the original dataset, training a separate decision tree on each sample, and averaging the predictions of each tree (aggregating). For the smaller dataset, we used "Leave One Out" (LOO) cross-validation to further reduce bias of the model. For the larger dataset, we used 10-fold cross-validation. We found this model did not predict well on either of the datasets, and was computationally expensive on the larger dataset. 
+
+Next we tried the Random Forest model, which extends the bagged trees model. In addition to using bootstrapped samples, random subsets of predictors are selected at each tree node, reducing correlation between the individual trees and improving model generalization. This model also did not perform well at predicting units sold, and was required a lot of processing time to train. For the larger dataset, we had to limit the number of trees to 10 in order to train a model that took less than 10 minutes to compute, which likely had an effect on the variance and predictive accuracy of the model, but not enough to make a difference considering how far off our predictions were. Again, LOO and 10-fold cross-validation were used for the smaller and larger datasets, respectively. 
+
+In retrospect I think the problem is with these datasets and the business question selected as far as why these models do not offer predictive accuracy -- the datasets contain largely uniform information that requires transformation and feature engineering to generate predictors that might better fit a model. A few thoughts for future exploration would be to calculate the per-unit profit of an item, and aggregating sales by month by region, so there is less variance within the variables.  
+
