@@ -1,0 +1,301 @@
+---
+title: "DATA 622 HW2"
+author: "Josh Iden"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::readthedown:
+    code_folding: show
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This assignment creates two decision trees from a single dataset from <https://excelbianalytics.com/wp/downloads-18-sample-csv-files-data-sets-for-testing-sales/> to solve a classification problem and predict the outcome of a particular feature or detail of the data. We then create a random forest for regression, analyze the results, and consider how we can change negative perceptions of decision trees with our result. We will use the following packages for this study,
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(randomForest)
+library(ROSE)
+library(ggthemes)
+library(egg)
+library(kableExtra)
+library(doParallel)
+```
+
+# The Data
+
+We'll use the 1000 sales records dataset for this assignment.
+
+```{r read_data}
+df <- read.csv('1000 Sales Records.csv')
+glimpse(df)
+```
+
+The dataset contains 1000 observations and 14 dimensions, a mix of numerical and categorical values.
+
+```{r}
+colSums(is.na(df))
+```
+
+There are no missing values in the dataset.
+
+# Data Prep
+
+We'll process the following changes to the data,
+
+-   column names to lowercase.\
+-   drop `order.id` and `country` columns.\
+-   convert `order.date` and `ship.date` to date.
+-   convert remaning <chr> columns to factor.\
+-   create column `time` as the difference in days between `order.date` and `ship.date`
+-   drop `order.date` and `ship.date`
+-   drop the dependencies `total.cost`, `total.profit`, `total.revenue`
+
+```{r data-prep1}
+# convert all column names to lowercase
+colnames(df) <- tolower(colnames(df))
+
+# drop columns and convert column types
+df <- df |>
+  select(-c(order.id, country)) |>
+  mutate(order.date = as.Date(order.date, format = "%m/%d/%Y"),
+         ship.date = as.Date(ship.date, format = "%m/%d/%Y")) |>
+  mutate(time = as.integer(ship.date - order.date),
+         month = as.factor(month(order.date)),
+         year = as.factor(year(order.date))) |>
+  mutate_if(is.character, as.factor) |>
+  select(-c(order.date, ship.date, total.cost, total.profit, total.revenue))
+
+glimpse(df)
+```
+
+```{r warning=FALSE, message=FALSE}
+df <- df |> 
+  group_by(region,
+           year,
+           month,
+           item.type,
+           sales.channel,
+           order.priority) |>
+  summarize(sold = sum(units.sold),
+            avg.cost = mean(unit.cost),
+            avg.price = mean(unit.price),
+            avg.time = mean(time)) |>
+  rename(item = item.type,
+         channel = sales.channel,
+         priority = order.priority)
+
+glimpse(df)
+```
+
+We've now reduced our dataset to 991 observations and 10 dimensions.
+
+Let's take a look at the distribution of average turnaround times, as this could be a possible outcome variable,
+
+```{r}
+df |>
+  ggplot(aes(x=avg.time)) +
+  geom_density(fill="lightblue") +
+  theme_few() +
+  labs(x="average time")
+```
+The distribution of average times are fairly uniform. 
+
+```{r}
+summary(df$avg.time)
+```
+
+The mean and the median are each 25. We create a new variable `delayed` for all orders that took longer than 30 days to ship:    
+
+```{r}
+df <- df |>
+  mutate(delayed = as.factor(ifelse(
+    avg.time > 30, 
+    "yes",
+    "no"))) |>
+  select(-avg.time)
+
+table(df$delayed)
+```
+
+We see there is some class imbalance. This could cause problems for our decision trees, so we oversample the minority class to balance the data. 
+
+```{r}
+balanced.data <- ROSE(delayed ~ ., data = df, seed = 123)$data
+
+table(balanced.data$delayed)
+```
+
+
+# Data Modeling
+
+We're going to predict if an order was delayed. The `delayed` variable is our response variable. 
+
+First we'll split the data 80/20 into training and testing sets.    
+
+```{r split-data, cache=TRUE}
+set.seed(1)
+
+# shuffle the dataset
+bd <- balanced.data[sample(nrow(balanced.data)), ]
+# create split point
+split.index <- createDataPartition(bd$delayed, p = .8, list = FALSE)
+
+# split the data
+train.set <- bd[split.index, ]
+test.set <- bd[-split.index, ]
+```
+
+
+## Decision Trees {.tabset}
+
+We generate the first decision tree and then hold out the first split node from our formula for the second tree.
+
+We observe that the root node in Decision Tree 1 splits at the `item` feature, so we hold that out Decision Tree 2, and we get a very different tree.
+
+**Decision Tree 1** splits at the `items` feature and achieves a depth of 8, then splits at two different features depending on the outcome of the root split. In this tree, the most important features are `items`, `year`, and `month`.
+
+**Decision Tree 2** splits at the `year` feature, and achieves a depth of 6. In this tree, the most important features are `year`, `month`, and `region`.
+
+Decision Tree 1 is far more complex than Decision Tree 2, indicating low bias, yet is barely more accurate, which suggests it is overfitting the data, a characteristic of high variance. 
+
+### Decision Tree 1
+
+```{r tree-1, fig.height=7, fig.width=9, warning=FALSE, cache=TRUE}
+set.seed(1) 
+
+tree.1 <- rpart(delayed ~ .,
+                data = train.set,
+                method = "class")
+
+rpart.plot(tree.1, tweak = 1.5)
+```
+
+We check the model against our test set, 
+
+```{r}
+set.seed(1)
+
+tree1.preds <- predict(tree.1, test.set, type="class")
+t1 <- confusionMatrix(tree1.preds, test.set$delayed)
+t1.results <- c(t1$overall['Accuracy'],
+                t1$byClass['Sensitivity'],
+                t1$byClass['Specificity'],
+                t1$byClass['Precision'],
+                t1$byClass['F1'])
+t1.results
+```
+
+
+
+### Decision Tree 2
+
+```{r tree-2, fig.height=7, fig.width=9, warning=FALSE, cache=TRUE}
+set.seed(1)
+
+tree.2 <- rpart(delayed ~ . -item,
+                data = train.set,
+                method = "class")
+
+rpart.plot(tree.2, tweak=1.5) 
+```
+
+We check the model against our test set, 
+
+```{r}
+set.seed(1)
+
+tree2.preds <- predict(tree.2, test.set, type="class")
+t2 <- confusionMatrix(tree2.preds, test.set$delayed)
+t2.results <- c(t2$overall['Accuracy'],
+                t2$byClass['Sensitivity'],
+                t2$byClass['Specificity'],
+                t2$byClass['Precision'],
+                t2$byClass['F1'])
+t2.results
+```
+
+
+## Random Forest
+
+Now we'll create a random forest for regression and analyze the results. 
+
+This can be computationally expensive so we prepare additional cores for parallel processing, 
+
+```{r}
+num_cores <- 4
+cl <- makeCluster(num_cores)
+```
+
+Next we'll train our model using 10-fold cross-validation, 
+
+```{r random-forest, warning=FALSE, message=FALSE, cache=TRUE}
+set.seed(1)
+
+registerDoParallel(cl)
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = TRUE
+)
+
+rf.model <- train(delayed ~ .,
+                         data = train.set,
+                         ntrees = 1000,
+                         method = "rf",
+                         trControl = ctrl,
+                         parallel = "multicore"
+                         )
+
+stopCluster(cl)
+```
+
+```{r}
+rf.model
+```
+
+Now we can check our model against the test data, 
+
+```{r}
+set.seed(1)
+
+rf.preds <- predict(rf.model, test.set)
+rfm <- confusionMatrix(rf.preds, test.set$delayed)
+rf.results <- c(rfm$overall['Accuracy'],
+                rfm$byClass['Sensitivity'],
+                rfm$byClass['Specificity'],
+                rfm$byClass['Precision'],
+                rfm$byClass['F1'])
+rf.results
+```
+
+Our model performs better on the testing data than on the training data, achieving 74% accuracy -- this demonstrates low variance. The sensitivity (true positive) is 73%. The model is good at detecting positive cases, in this case, if an order isn't delayed. The model can predict with 73% accuracy if an order isn't delayed. The specificity (true negative) is a bit higher at 75%. This indicates the model can identify negative cases (delayed orders) with an accuracy of 75%. 
+
+We can observe the most important variables to our model:
+
+```{r}
+plot(varImp(rf.model), 10)
+```
+
+Interestingly, these are not the variables that our individual decision trees chose. In our random forest, the size of the order (`sold`) and the price and cost of the items in the order are by far the biggest predictors of whether an order will be on time or delayed. This makes instinctive sense, as large orders may require restocks, or the price of an order may indicate its popularity, which may also affect restocking -- things that might contribute to whether an order is shipped quickly. 
+
+Comparing results across models, 
+
+```{r}
+kable(rbind(tree1 = t1.results,
+      tree2 = t2.results,
+      rf = rf.results)) |>
+  kable_styling()
+```
+
+# Discussion    
+
+To summarize this analysis, we feature engineered a dataset containing sales data, and created a binary response variable representing whether an order was delayed, resampling our data in order to achieve class balance of our response variable. Splitting our data into training and testing sets (using an 80/20 split) we built a decision tree that identified the items contained in the order as a predictor, then built a second tree removing the items as a predictor, and observed the tree selected specific years as predictors. We next trained the models to make predictions on the testing data and observed that the first tree was more complex and exhibited low bias and high variance - as it was likely overfitting the data, while the second tree was simpler and proved to be more accurate. This highlights the bias-variance tradeoff. **Bias** refers to the error introduced when simplifying a problem, for example making assumptions about the data, whereas **variance** refers to the model's sensitivity to small changes in the training data. High bias models may have lower variance but they may be underfitting the data. In this case, decision tree 2 has higher bias and lower variance than decision tree 1, and is more accurate. One way to balance bias and variance is to utilize an ensemble method such as random forest, that randomly samples and aggregates the predictions of multiple trees, and as such are less likely to overfit and more likely to better generalize to the unseen data, providing a more accurate model. Our next step illustrates this, as we trained a random forest model using 10-fold cross-validation to further reduce variance  and achieved a predictive accuracy of 74% on the remaining 20% of our data, while our model predicted with 73% accuracy whether an order wasn't delayed.  We observed in our random forest that the most important predictors in our model were the number of items sold, the average cost, and the average price, not, as identified in our earlier individual trees, the specific items or years that an order was placed. This highlights what is described in the <https://decizone.com/blog/the-good-the-bad-the-ugly-of-using-decision-trees> article as "The BAD", or disadvantages of using a decision tree. The individual decision trees failed to identify what were overall the most important variables to our predictive model. Our individual decision trees also highlight what the article refers to as "The UGLY" -- the trees are complex and hard to interpret. One of the ways that we can change the perception when using the decision trees we created would be to contextualize the tree -- describe it as part of the exploratory analysis, and simplifying the labeling so it is more legible, explaining to the audience the decision-making process of excluding the key feature from the second tree, and comparing the final result with the earlier iterations, explaining how the random forest model uses cross-validation to reduce variance in the model. The key takeaway from this assignment is that random forests, by randomly bootstrapping samples from the data and aggregating the predictions of multiple trees, is able to capture complex patterns in the data that might is not apparent in an individual tree. The result is a model with less variance than individual models and is more generizable to unseen data. One way to illustrate this to stakeholders if you're walking  through the concept of a random forest would be to recreate the steps we just took -- build a few decision trees with different predictors that will look different and then explain how a random forest does this n times (in our case, 1000) and averages the results to make more accurate predictions. 
