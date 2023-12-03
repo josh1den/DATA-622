@@ -1,0 +1,408 @@
+---
+title: "DATA 622 HW3"
+author: "Josh Iden"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::readthedown:
+    code_folding: show
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This assignment compares the accuracy of the Support Vector Machines and Random Forests on a previously used dataset from <https://excelbianalytics.com/wp/downloads-18-sample-csv-files-data-sets-for-testing-sales/>.
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(randomForest)
+library(ROSE)
+library(ggthemes)
+library(egg)
+library(kableExtra)
+library(doParallel)
+```
+
+# The Data
+
+We use the 1000 sales records data for this analysis.
+
+```{r read_data}
+df <- read.csv('1000 Sales Records.csv')
+glimpse(df)
+```
+
+# Data Prep
+
+We follow the same preprocessing steps as in the previous assignment.
+
+We process the following changes to the data,
+
+-   column names to lowercase.\
+-   drop `order.id` and `country` columns.\
+-   convert `order.date` and `ship.date` to date.
+-   convert remaning <chr> columns to factor.\
+-   create column `time` as the difference in days between `order.date` and `ship.date`
+-   drop `order.date` and `ship.date`
+-   drop the dependencies `total.cost`, `total.profit`, `total.revenue`
+
+```{r data-prep1}
+# convert all column names to lowercase
+colnames(df) <- tolower(colnames(df))
+
+# drop columns and convert column types
+df <- df |>
+  select(-c(order.id, country)) |>
+  mutate(order.date = as.Date(order.date, format = "%m/%d/%Y"),
+         ship.date = as.Date(ship.date, format = "%m/%d/%Y")) |>
+  mutate(time = as.integer(ship.date - order.date),
+         month = as.factor(month(order.date)),
+         year = as.factor(year(order.date))) |>
+  mutate_if(is.character, as.factor) |>
+  select(-c(order.date, ship.date, total.cost, total.profit, total.revenue))
+
+glimpse(df)
+```
+
+```{r warning=FALSE, message=FALSE}
+df <- df |> 
+  group_by(region,
+           year,
+           month,
+           item.type,
+           sales.channel,
+           order.priority) |>
+  summarize(sold = sum(units.sold),
+            avg.cost = mean(unit.cost),
+            avg.price = mean(unit.price),
+            avg.time = mean(time)) |>
+  rename(item = item.type,
+         channel = sales.channel,
+         priority = order.priority)
+
+glimpse(df)
+```
+
+We've now reduced our dataset to 991 observations and 10 dimensions.
+
+Let's take a look at the distribution of average turnaround times, as this could be a possible outcome variable,
+
+```{r}
+df |>
+  ggplot(aes(x=avg.time)) +
+  geom_density(fill="lightblue") +
+  theme_few() +
+  labs(x="average time")
+```
+
+The distribution of average times are fairly uniform.
+
+```{r}
+summary(df$avg.time)
+```
+
+The mean and the median are each 25. We create a new variable `delayed` for all orders that took longer than 30 days to ship:
+
+```{r}
+df <- df |>
+  mutate(delayed = as.factor(ifelse(
+    avg.time > 30, 
+    "yes",
+    "no"))) |>
+  select(-avg.time)
+
+table(df$delayed)
+```
+
+We see there is some class imbalance. This could cause problems for our decision trees, so we oversample the minority class to balance the data.
+
+```{r}
+balanced.data <- ROSE(delayed ~ ., data = df, seed = 123)$data
+# reorder factor levels  
+balanced.data$delayed <- factor(balanced.data$delayed, levels=c("yes","no"))
+
+table(balanced.data$delayed)
+```
+
+# Data Modeling {.tabset}
+
+We want to predict if an order is delayed. The `delayed` variable is our response variable.
+
+First we'll split the data 80/20 into training and testing sets.
+
+```{r split-data, cache=TRUE}
+set.seed(1)
+
+# shuffle the dataset
+bd <- balanced.data[sample(nrow(balanced.data)), ]
+# create split point
+split.index <- createDataPartition(bd$delayed, p = .8, list = FALSE)
+
+# split the data
+train.set <- bd[split.index, ]
+test.set <- bd[-split.index, ]
+```
+
+## Random Forest
+
+```{r random-forest, warning=FALSE, message=FALSE, cache=TRUE}
+set.seed(1)
+
+# enable clusters for parallel processing
+num_cores <- 4
+cl <- makeCluster(num_cores)
+
+registerDoParallel(cl)
+
+# initialize 10-fold cross validation
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = TRUE
+)
+
+start <- Sys.time()
+
+# train the model
+rf.model <- train(delayed ~ .,
+                         data = train.set,
+                         ntrees = 1000,
+                         method = "rf",
+                         trControl = ctrl,
+                         parallel = "multicore"
+                         )
+
+end <- Sys.time()
+
+elapsed.time <- round(as.numeric(difftime(end, start, units = "secs")),2)
+  
+# make predictions on the test set
+rf.preds <- predict(rf.model, test.set)
+
+# build confusion matrix
+rfm <- confusionMatrix(rf.preds, test.set$delayed)
+
+# calculate the receiver operating characteristic (ROC)
+rf.roc <- pROC::roc(as.numeric(rf.preds == "yes"), as.numeric(test.set$delayed == "yes"))
+
+# extract results
+rf.results <- c(rfm$overall['Accuracy'],
+                rfm$byClass['Sensitivity'],
+                rfm$byClass['Specificity'],
+                rfm$byClass['Precision'],
+                rfm$byClass['F1'],
+                "AUC" = rf.roc$auc[1],
+                "Time" = elapsed.time)
+rf.results
+
+stopCluster(cl)
+```
+
+`Accuracy`: the model correctly predicted the class for approximately 71% of instances.\
+`Sensitivity` (true positive): the model correctly identified approximately 72% of instances where delayed = "yes".\
+`Specificity` (true negative): the model correctly identified approx. 70% of instances where delayed = "no".\
+`Precision`: the proportion of positive predictions that are actually positive - when the model predicted "yes", it was correct 70% of the time.\
+`F1`: the harmonic mean of precision and sensitivity, a score of approx 71% indicating a balance between precision and sensitivity.\
+`AUC`: Area Under the ROC Curve - an AUC above 0.7 is considered acceptable discrimination between positive and negative classes. The AUC of 0.7108 indicates the model distinguishes between the classes well.
+
+```{r rf-plots}
+plot(rf.model, main="Accuracy vs. Number of Predictors")
+plot(rf.roc, main="ROC plot")
+
+par(mfrow = c(1, 2))
+```
+
+The model achieves highest accuracy when it randomly selects 22 predictors.
+
+## SVM {.tabset}
+
+Support Vector Machines work by margin maximization -- finding the hyperplane (decision boundary) that maximizes the distance between data points of different classes. The resulting nearest data points to the hyperplane with the widest margin are known as "support vectors". 
+
+One of the benefits of Support Vector Machines is the choice of kernel function to determine the type of decision boundary the algorithm generates to separate the data. We know from our earlier EDA that the predictors form a non-linear relationship with the response, so we model two types of kernel functions, the radial basis function and the polynomial function to see which one better splits the data.
+
+### Radial Kernel
+
+```{r svm-radial, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(1)
+
+# enable clusters for parallel processing
+num_cores <- 4
+cl <- makeCluster(num_cores)
+
+registerDoParallel(cl)
+
+# initialize 10-fold cross validation
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = TRUE
+)
+
+# Define the hyperparameter grid for tuning
+radialGrid <- expand.grid(C = c(0.1, 1, 10),
+                                   sigma = c(0.01, 0.1, 1))
+
+start <- Sys.time()
+
+# train the model
+svmRadial.model <- train(delayed ~ .,
+                         data = train.set,
+                         method = "svmRadial",
+                         trControl = ctrl,
+                         parallel = "multicore",
+                         tuneGrid = radialGrid)
+
+end <- Sys.time()
+
+elapsed.time <- round(as.numeric(difftime(end, start, units = "secs")),2)
+  
+# make predictions on the test set
+svmRadial.preds <- predict(svmRadial.model, test.set)
+
+# build confusion matrix
+svmRadial <- confusionMatrix(svmRadial.preds, test.set$delayed)
+
+# calculate the receiver operating characteristic (ROC)
+svmRadial.roc <- pROC::roc(as.numeric(svmRadial.preds == "yes"), as.numeric(test.set$delayed == "yes"))
+
+# extract results
+svmRadial.results <- c(svmRadial$overall['Accuracy'],
+                 svmRadial$byClass['Sensitivity'],
+                 svmRadial$byClass['Specificity'],
+                 svmRadial$byClass['Precision'],
+                 svmRadial$byClass['F1'],
+                 "AUC" = svmRadial.roc$auc[1],
+                 "Time" = elapsed.time)
+
+svmRadial.results
+
+stopCluster(cl)
+```
+
+```{r svmRadial-plots}
+plot(svmRadial.model, main="Tuning Plot")
+plot(svmRadial.roc, main="ROC plot")
+
+par(mfrow = c(1, 2))
+```
+
+### Polynomial Kernel
+
+```{r svm-poly, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(1)
+
+# enable clusters for parallel processing
+num_cores <- 4
+cl <- makeCluster(num_cores)
+
+registerDoParallel(cl)
+
+# initialize 10-fold cross validation
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = TRUE
+)
+
+# Define the hyperparameter grid for tuning
+polyGrid <- expand.grid(degree = c(2, 3, 4),
+                        scale = c(0.1, 1, 10),
+                        C = c(0.1, 1, 10))
+
+start <- Sys.time()
+
+# train the model
+svmPoly.model <- train(delayed ~ .,
+                         data = train.set,
+                         method = "svmPoly",
+                         trControl = ctrl,
+                         parallel = "multicore",
+                         tuneGrid = polyGrid)
+
+end <- Sys.time()
+
+elapsed.time <- round(as.numeric(difftime(end, start, units = "secs")),2)
+  
+# make predictions on the test set
+svmPoly.preds <- predict(svmPoly.model, test.set)
+
+# build confusion matrix
+svmPoly <- confusionMatrix(svmPoly.preds, test.set$delayed)
+
+# calculate the receiver operating characteristic (ROC)
+svmPoly.roc <- pROC::roc(as.numeric(svmPoly.preds == "yes"), as.numeric(test.set$delayed == "yes"))
+
+# extract results
+svmPoly.results <- c(svmPoly$overall['Accuracy'],
+                 svmPoly$byClass['Sensitivity'],
+                 svmPoly$byClass['Specificity'],
+                 svmPoly$byClass['Precision'],
+                 svmPoly$byClass['F1'],
+                 "AUC" = svmPoly.roc$auc[1],
+                 "Time" = elapsed.time)
+
+svmPoly.results
+
+stopCluster(cl)
+```
+
+```{r svmPoly-plots}
+plot(svmPoly.model, main="Tuning Plot")
+plot(svmPoly.roc, main="ROC plot")
+
+par(mfrow = c(1, 2))
+```
+
+```{r}
+svmPoly.model$bestTune
+```
+
+We can see that the highest accuracy was achieved with degree = 2, scale = 0.1, cost = 10.
+
+Cost represents the regularization parameter C, which controls the trade-off between maximizing the margin and minimizing the misclassification of data points. The larger the value of C, the narrower the margin, the lower the likelihood of misclassification. 
+
+# Comparison
+
+```{r comparison, warning=FALSE, message=FALSE}
+rbind("random forest" = rf.results,
+      "svm - radial" = svmRadial.results,
+      "svm - polynomial" = svmPoly.results) |>
+  kable() |>
+  kable_styling()
+```
+
+Comparing the three models,
+
+`Accuracy`: the `svm-radial` model achieves the highest overall accuracy, but it does so by overclassifying negative outcomes, as represented by its 1 scores for `specificity` and `precision`.\
+`Sensitivity`: the `svm-polynomial` model has a lower overall accuracy than the radial kernel model, but correctly identifies 82.4% of instances where 'delayed' = "yes". Despite having a lower overall accuracy than the radial model, this would be the preferred model to detect which orders are likeliest to be delayed. The `Sensitivity` of the radial model indicates the model correctly identified all negative outcomes.\
+The `Precision` of the radial model indicates that the model did not have any false positives (or the result would be less than 1).\
+`F1`: the `svm-polynomial` model also has the highest F1 score, indicating the strongest balance between precision and sensitivity.
+
+The Area Under the Curve (AUC) is highest for the radial kernel but again, this is due to the model overclassifying negative occurrences, and even after rebalancing the data, there are slightly more negative occurrences than positive, so this is weighing the overall accuracy of the model.
+
+While the polynomial kernel consumed more processing time than the radial kernel, it did so while performing grid search, and even still outperforming the random forest in terms of speed. Once the optimal hyperparameters are chosen, the processing time for this model in production is vastly superior to the random forest model. The perfect specificity and precision of the polynomial model combined with its low sensitivity indicates that while that model has the highest overall accuracy and doesn't incorrectly predict positive outcomes, it predicts many false negatives. If a company wants to predict whether an order will be delayed, the model will be less accurate than both the random forest and the polynomial kernel models. This highlights a key benefit of the support vector machines use of the kernel trick to determine the optimal decision boundary, and also a key aspect of classification modeling -- choosing the model that best achieves the desired business outcome. This does not always mean the model with the most straightforward overall accuracy, but the model that best predicts the outcome that serves the business use. In this case, we want to identify orders that are likely to be delayed. Our polynomial SVM, while having a lower overall accuracy and AUC, correctly identifies 82.4% of orders that are delayed, compared with 64.9% for the radial kernel.
+
+In terms of overall accuracy, the SVM radial kernel would be recommended, however for the business use, the SVM polynomial kernel model would be my choice for best results in predicting if an order will be delayed. For this particular dataset modeled as a classification problem, SVMs are recommended. For a dataset of this size (991 observations), Random Forests may not perform as well as SVMs. Conversely, SVMs work well with smaller, high dimensional datasets, whereas as datasets become larger, SVMs can become computationally expensive. The kernel trick also allows SVMs to capture complex relationships that random forests may miss. One downside, however, is that Random Forests may be more interpretable than SVMs regarding which features drive the modeling, in order to return actionable insights to stakeholders.
+
+Random Forests worked will for classification problems in the 2019 Coronavirus study [1] but were outperformed by SVMs in 2021 [2]. One recent study found that Support Vector Machines outperformed Random Forests for regression tasks when there was a high correlation between its features, while Random Forests performed better when the features exhibited little or no correlation [3]. However, this study relied on two different datasets consisting of different dimensions -- the high correlation data comprised 15 features and 1000 observations while the low correlation data contained 12 features and 8523 observations -- which indicates dimensionality and size of dataset may account for the discrepencies in performance. In a smaller classification study with higher dimensional data (35 features, 597 observations), Random Forests outperform SVMs in all metrics [4]. Another study found that K-nearest neighbor outperformed Random Forest and SVMs in a lower feature space dataset [5]. There is no clear indication that one is consistently more accurate than another. This supports the "no free lunch" heuristic. There is no one-size-fits-all model. Specific data characteristics will inform one model's effectiveness over another, and preprocessing, hyperparameter tuning, and comparison modeling are necessary steps to finding the algorithm which best models the data.
+
+<u>References</u>
+
+1.  Ahmad, A., Safi, O., Malebary, S., Alesawi, S., & Alkayal, E. (2021). Decision Tree Ensembles to Predict Coronavirus Disease 2019 Infection: A Comparative Study. *Complexity (New York, N.Y.)*, *2021*, 1--8. <https://doi.org/10.1155/2021/5550344>
+
+2.  Guhathakurata S, Kundu S, Chakraborty A, Banerjee JS. A novel approach to predict COVID-19 using support vector machine. Data Science for COVID-19. 2021:351--64. doi: 10.1016/B978-0-12-824536-1.00014-9. Epub 2021 May 21. PMCID: PMC8137961.
+
+3.  Merdas, H. M., & Mousa, A. H. (2023). Food sales prediction model using machine learning techniques. *International Journal of Electrical and Computer Engineering (Malacca, Malacca)*, *13*(6), 6578-. <https://doi.org/10.11591/ijece.v13i6.pp6578-6585>
+
+4.  Biswas, A. K., Seethalakshmi, R., Mariappan, P., & Bhattacharjee, D.
+    (2023). An ensemble learning model for predicting the intention to quit
+    among employees using classification algorithms. *Decision Analytics Journal*, *9*, 100335-. <https://doi.org/10.1016/j.dajour.2023.100335>
+
+5.  Albab, M. U., Utami, E., & Ariatmanto, D. (2023). Comparison of Algorithms for Sentiment
+    Analysis of Operator Satisfaction Level for Increasing Neo Feeder Applications in PDDikti Higher Education LLDIKTI Region VI Semarang Central Java. *Sinkron*, *8*(4), 2099--2108. <https://doi.org/10.33395/sinkron.v8i4.12907>
