@@ -1,0 +1,836 @@
+---
+title: "DATA 622 HW4"
+author: "Josh Iden"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::readthedown:
+    code_folding: show
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction   
+
+This assignment examines a [Kaggle dataset](https://www.kaggle.com/datasets/fedesoriano/heart-failure-prediction/data) combining data from the [UCI Machine Learning Repository](https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/) containing patient information and whether or not the patient developed heart disease. We'll compare the performance of Support Vector Machines and Neural Networks to develop a machine learning model that makes accurate classification given the data.  
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(nnet)
+library(elmNN)
+library(keras)
+library(tensorflow)
+library(ROSE)
+library(corrplot)
+library(ggthemes)
+library(egg)
+library(kableExtra)
+library(doParallel)
+```
+
+# Exploratory Data Analysis   
+
+We load the data and coerce the `char` type variables to factors. We also standardize the column names to lowercase for easier coding.
+
+```{r loading-data, warning=FALSE, message=FALSE}
+df <- read.csv('heart.csv')
+
+# Identify character columns
+char_columns <- sapply(df, is.character)
+
+# Convert character columns to factors
+df[char_columns] <- lapply(df[char_columns], as.factor)
+
+# convert all column names to lowercase
+colnames(df) <- tolower(colnames(df))
+
+glimpse(df)
+```
+The dataset contains 918 observations and 12 features.   
+
+`age`: the age of the patient in years.   
+`sex`: the sex of the patient (M: Male, F: Female).   
+`chestpaintype`: type of chest pain (TA: Typical Angina, ATA: Atypical Angina, NAP: Non-Anginal Pain, ASY: Asymptomatic).  
+`restingbp`: resting blood pressure (mm Hg).   
+`cholesterol`: serum cholesterol (mm/dl).   
+`fastingbs`: fasting blood sugar (1: if FastingBS > 120mg/dl, 0: otherwise).   
+`restingecg`: resting electrocardiogram results (Normal: Normal, ST: having ST-T wave abnormality (T wave inversions and/or ST elevation or depression of > 0.05 mV), LVH: showing probable or definite left ventricular hypertrophy by Estes' criteria).  
+`maxhr`: maximum heart rate achieved (Numerica value between 60 and 202).   
+`exerciseangina`: exercise-induced angina (Y: Yes, N: No).   
+`oldpeak`: oldpeak = ST (Numeric value measured in depression).    
+`st_slope`: the slope of the peak exercise ST segment (Up: upsloping, Flat: flat, Down: downsloping).    
+`heartdisease`: output class (1: Heart disease, 0: Normal).    
+
+```{r any-nas}
+colSums(is.na(df))
+```
+There are no missing values in the dataset. 
+
+Although I've already converted the `chr` type columns to factors, I want to take a look at the `oldpeak` and `fastingbs` variables to identify if they are categorical or numeric. 
+
+```{r eda-1}
+print(paste0("Old Peak unique values: ",n_distinct(df$oldpeak)))
+print(paste0("Fastingbs unique values: ", n_distinct(df$fastingbs)))
+```
+
+The `oldpeak` variable is in fact numeric so we leave as is, we'll convert `fastingbs` to factor. We'll also convert the `heartdisease` response variable to factor and recode it as "yes" (1) or "no" (0), 
+
+```{r eda-2}
+df <- df |>
+  mutate(fastingbs = as.factor(fastingbs),
+         heartdisease = factor(ifelse(heartdisease == 1, "yes", "no"),
+                               levels=c("yes","no"))) 
+
+levels(df$heartdisease)
+```
+
+Now we'll take a look at the distribution of the numeric and categorical variables. 
+
+```{r eda-numeric-dist}
+df |>
+  keep(is.numeric) |>
+  gather() |>
+  ggplot(aes(x = value)) +
+  geom_density(fill="lightblue") +
+  labs(title = "Distribution Plots - Numerical Predictors") +
+  facet_wrap(~ key, scales = "free") +
+  theme_few() +
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+```
+
+A few observations:   
+
+1. `age`, `maxhr`, and `restingbp` are approximately normal, although with skew and some bimodality. 
+2. `cholesterol` appears to have some outliers.    
+3. `oldpeak` is right-skewed.    
+
+Let's take a look at the relationship between the variables with the response. 
+
+```{r eda-numerical-box, cache=TRUE}
+df |>
+  dplyr::select(is.numeric, heartdisease) |>
+  gather(key = "key", value = "value", -heartdisease) |>
+  ggplot(aes(x = heartdisease, y = value)) +
+  geom_boxplot(fill="lightblue") +
+  labs(x = "heart disease",
+       title = "Distribution Plots - Numerical Predictors") +
+  facet_wrap(~ key, scales = "free_y", nrow=1) +
+  theme_few() +
+  theme(axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+```
+
+We can see there does seem to be a relationship between the numerical predictors and the response. Let's check for multicollinearity, 
+
+```{r corrplot}
+df |> 
+  dplyr::select(is.numeric) |> 
+  cor() |>
+  corrplot(method="shade",
+           type="lower",
+           diag=F)
+```
+Unsurprisingly, `age` shows some multicollinearity with the other numeric features, but not enough to be of concern. 
+
+Let's look at the distribution of the categorical variables, 
+
+```{r eda-categorical}
+df |>
+  dplyr::select(!is.numeric, heartdisease) |>
+  gather(key = "key", value = "value", -heartdisease) |>
+  ggplot(aes(x=value,fill=heartdisease)) +
+    geom_bar(position="dodge") +
+    labs(x = "",
+         title = "Distribution Plots - Categorical Predictors") +
+    facet_wrap(~key, scales="free") +
+    scale_fill_brewer(palette="BuGn") + 
+    theme_few() +
+    theme(axis.text.y = element_blank(),
+          axis.title.y = element_blank(),
+          plot.title = element_text(hjust = 0.5))
+```
+There are some pretty identifiable patterns apparent in the data, for example, the prevalence of heart disease amongst `chestpaintype` of "ASY" and `st_slope` of "Flat". 
+
+Let's take a look at the distribution of the response variable, 
+
+```{r eda-response}
+table(df$heartdisease)
+```
+
+We can see it's a little out of balance. An imbalance in the response variable can lead to bias towards the majority class. We can address this problem by oversampling the minority class of observations to balance our data. 
+
+```{r balancing-data}
+balanced.data <- ROSE(heartdisease ~ ., data = df, seed = 123)$data
+
+table(balanced.data$heartdisease)
+```
+
+# Data Prep   
+
+We create some helper functions to split our data and train/test our models. We'll be using 10-fold cross-validation in our models to reduce variance in the training models. We'll also be scaling the numeric predictors to improve model performance. We won't be centering the data - as there are no values below zero, this is an unnecessary step to consume computational resources. 
+
+## Helper Functions {.tabset}
+
+### Data Splitting
+
+This function shuffles and splits the data using an 80/20 split.  
+
+```{r data-splitting, warning=FALSE, message=FALSE}
+data.splitter <- function(df) {
+  set.seed(1)
+  
+  # scale the data
+  numeric_features <- sapply(df, is.numeric)
+
+  # Create a pre-processing object to scale the numeric features between 0 and 1
+  preprocess_params <- preProcess(df[numeric_features], method = c("range"), range = c(0, 1))
+
+  # Apply the scaling transformation
+  df[numeric_features] <- predict(preprocess_params, df[numeric_features])
+
+  # Shuffle the dataset
+  shuffled <- df[sample(nrow(df)), ]
+
+  # Create split point
+  split.index <- createDataPartition(df$heartdisease, p = 0.8, list = FALSE)
+
+  # Split the data
+  train.set <- shuffled[split.index, ]
+  test.set <- shuffled[-split.index, ]
+
+  # Print the code
+  cat(sprintf("Training set contains %d rows.", dim(train.set)[1]),
+      sprintf("\nTesting set contains %d rows.", dim(test.set)[1]))
+
+  # Return the processed data
+  return(list(train.set = train.set, test.set = test.set))
+}
+```
+
+### SVM Modeling   
+
+This function takes the desired preprocessing steps along with a hyperparamter tuning grid and kernel specification and trains and tests the model. 
+
+```{r svm-modeling, warning=FALSE, message=FALSE, cache=TRUE}
+svm.deploy <- function(df, method, ctrl, grid){
+  set.seed(1)
+  
+  # split data
+  split.data <- data.splitter(df)
+  train.set <- split.data$train.set
+  test.set <- split.data$test.set
+  
+  # enable clusters for parallel processing
+  cl <- makeCluster(4)
+  registerDoParallel(cl)
+
+  start <- Sys.time()
+  
+  if (method == "linear"){
+    model <- caret::train(
+      heartdisease ~ .,
+      data = train.set,
+      method = "svmLinear",
+      trControl = ctrl,
+      preProc = "scale",
+      tuneGrid = grid,
+      tuneLength = 10)
+  } else if (method == "poly"){
+    model <- caret::train(
+      heartdisease ~ .,
+      data = train.set,
+      method = "svmPoly",
+      trControl = ctrl,
+      preProc = "scale",
+      tuneGrid = grid,
+      tuneLength = 10)
+  } else {
+    model <- caret::train(
+      heartdisease ~ .,
+      data = train.set,
+      method = "svmRadial",
+      trControl = ctrl,
+      preProc = "scale",
+      tuneGrid = grid,
+      tuneLength = 10)
+  }
+
+  end <- Sys.time()
+
+  elapsed.time <- as.numeric(difftime(end, start, units = "secs"))
+  
+  # make predictions on the test set
+  preds <- predict(model, test.set)
+
+  # build confusion matrix
+  cm <- confusionMatrix(preds, test.set$heartdisease)
+
+  # calculate the receiver operating characteristic (ROC)
+  roc <- pROC::roc(as.numeric(preds == "yes"), as.numeric(test.set$heartdisease == "yes"))
+
+  # extract results
+  results <- c(cm$overall['Accuracy'],
+                 cm$byClass['Sensitivity'],
+                 cm$byClass['Specificity'],
+                 cm$byClass['Precision'],
+                 cm$byClass['F1'],
+                 "AUC" = roc$auc[1],
+                 "Time" = elapsed.time)
+
+  stopCluster(cl)
+  
+  return(list(model = model, results = results, cm = cm))
+}
+```
+
+### Neural Network Modeling   
+
+This function takes the desired preprocessing steps along with a hyperparamter tuning grid and trains and tests the model.
+
+```{r nn-modeling, message=FALSE, warning=FALSE, cache=TRUE}
+nn.deploy <- function(df, method, ctrl, grid){
+  set.seed(1)
+  
+  # split data
+  split.data <- data.splitter(df)
+  train.set <- split.data$train.set
+  test.set <- split.data$test.set
+  
+  # enable clusters for parallel processing
+  cl <- makeCluster(4)
+  registerDoParallel(cl)
+
+  start <- Sys.time()
+  
+  if (method == "nnet"){
+    model <- caret::train(
+      heartdisease ~ .,
+      data = train.set,
+      method = "nnet",
+      trControl = ctrl,
+      preProc = "scale",
+      tuneGrid = grid,
+      MaxNWts = 5000)
+  } else if (method == "pca"){
+    model <- caret::train(
+      heartdisease ~ .,
+      data = train.set,
+      method = "nnet",
+      trControl = ctrl,
+      preProc = "pca",
+      tuneGrid = grid,
+      MaxNWts = 5000)
+  } else if (method == "av"){
+    model <- caret::train(
+      heartdisease ~ .,
+      data = train.set,
+      method = "avNNet",
+      trControl = ctrl,
+      preProc = "scale",
+      tuneGrid = grid,
+      MaxNWts = 5000)
+  } else {
+    model <- caret::train(
+      heartdisease ~ .,
+      data = train.set,
+      method = "elm",
+      trControl = ctrl,
+      preProc = "scale",
+      tuneGrid = grid)
+  }
+
+  end <- Sys.time()
+
+  elapsed.time <- as.numeric(difftime(end, start, units = "secs"))
+  
+  # make predictions on the test set
+  preds <- predict(model, test.set)
+
+  # build confusion matrix
+  cm <- confusionMatrix(preds, test.set$heartdisease)
+
+  # calculate the receiver operating characteristic (ROC)
+  roc <- pROC::roc(as.numeric(preds == "yes"), as.numeric(test.set$heartdisease == "yes"))
+
+  # extract results
+  results <- c(cm$overall['Accuracy'],
+                 cm$byClass['Sensitivity'],
+                 cm$byClass['Specificity'],
+                 cm$byClass['Precision'],
+                 cm$byClass['F1'],
+                 "AUC" = roc$auc[1],
+                 "Time" = elapsed.time)
+
+  stopCluster(cl)
+  
+  return(list(model = model, results = results, cm = cm))
+}
+```
+
+### ReLU Function Modeling
+
+```{r relu-modeling, warning=FALSE, message=FALSE, cache=TRUE}
+relu.deploy <- function(df){
+  # split data
+  split.data <- data.splitter(df)
+  train.set <- split.data$train.set
+  test.set <- split.data$test.set
+  
+  set.seed(1)
+  
+  # define a relu neural network
+  network <- keras_model_sequential() |>
+    layer_dense(units = 32, activation = "relu", input_shape = ncol(train.set) - 1) |>
+    layer_dense(units = 16, activation = "relu") |>
+    layer_dense(units = 1, activation = "sigmoid")
+
+  # Compile the model
+  network |> compile(
+    loss = "binary_crossentropy",
+    optimizer = optimizer_adam(),
+    metrics = c("accuracy")
+    )
+  
+  # Define AUC metric function
+  auc_metric <- function(y_true, y_pred) {
+    auc(roc(y_true, y_pred))
+  }
+  
+  # Set up control for 10-fold cross-validation
+  ctrl <- trainControl(method = "cv", 
+                       number = 10, 
+                       savePredictions = TRUE, 
+                       classProbs = TRUE)
+  
+  # enable clusters for parallel processing
+  cl <- makeCluster(4)
+  registerDoParallel(cl)
+
+  start <- Sys.time()
+  
+  # Train the model using internal 10-fold cross-validation
+  fit_results <- fit(
+    network,
+    x = as.matrix(train.set[, -ncol(train.set)]),  # Exclude the response variable
+    y = as.matrix(train.set$heartdisease),  # Convert to numeric
+    epochs = 10,
+    batch_size = 32,
+    validation_split = 0.2,
+    verbose = 0
+    )
+  
+  # Find the epoch with the best validation AUC
+  best.epoch <- which.max(fit_results$metrics$val_accuracy)
+  
+  # Train the final model on the entire training set
+  model <- keras_model_sequential() |>
+    layer_dense(units = 32, activation = "relu", input_shape = ncol(train.set) - 1) |>
+    layer_dense(units = 16, activation = "relu") |>
+    layer_dense(units = 1, activation = "sigmoid")
+
+  # Compile the final model
+  model |> compile(
+    loss = "binary_crossentropy",
+    optimizer = optimizer_adam(),
+    metrics = c("accuracy")
+  )
+
+  # Save the weights from the best epoch
+  save_model_weights_hdf5(model, filepath = "best_weights.h5")
+
+  # Load the weights from the best epoch
+  model |> load_model_weights_hdf5(filepath = "best_weights.h5")
+  
+  # # Convert response variable to a binary factor
+  # train.set$heartdisease <- as.factor(train.set$heartdisease)
+  # 
+  # # Convert the factor to integer labels (0 and 1)
+  # train.labels <- as.integer(train.set$heartdisease)
+  # 
+  # # Convert features and labels to matrices
+  # train.features <- as.matrix(train.set[, -ncol(train.set)])
+  # train.labels <- as.matrix(train.labels)
+
+  # Fit the final model on the entire training set
+  model |> fit(
+    x = as.matrix(train.set[, -ncol(train.set)]),  # Exclude the response variable
+    y = as.matrix(train.set$heartdisease),  # Convert to numeric
+    # x = train.features,  
+    # y = train.labels,
+    epochs = as.integer(best.epoch),  # Use the epoch with the best validation AUC
+    batch_size = 32,
+    verbose = 0
+  )
+
+  end <- Sys.time()
+
+  elapsed.time <- as.numeric(difftime(end, start, units = "secs"))
+  
+  # Make predictions on the test set
+  preds <- predict(model, as.matrix(test.set[, -ncol(test.set)]), type = "raw")
+
+  # Convert predicted probabilities to class predictions (0 or 1)
+  predicted_classes <- ifelse(preds > 0.5, 1, 0)
+
+  # Confusion matrix
+  cm <- confusionMatrix(data = factor(predicted_classes), 
+                        reference = factor(test.set$heartdisease),
+                        positive = "1")
+  
+  # calculate the receiver operating characteristic (ROC)
+  roc <- pROC::roc(predicted_classes == 1, as.numeric(test.set$heartdisease == 1))
+  
+  # extract results
+  results <- c(cm$overall['Accuracy'],
+               cm$byClass['Sensitivity'],
+               cm$byClass['Specificity'],
+               cm$byClass['Precision'],
+               cm$byClass['F1'],
+               "AUC" = roc$auc[1],
+               "Time" = elapsed.time)
+
+  stopCluster(cl)
+  
+  return(list(model = model, results = results, cm = cm))
+}
+```
+
+# Modeling {.tabset}
+
+We compare Support Vector Machines with Neural Networks in the tabs below. 
+
+## SVM {.tabset}
+
+Support Vector Machines work by margin maximization -- finding the hyperplane (decision boundary) that maximizes the distance between data points of different classes. The resulting nearest data points to the hyperplane with the widest margin are known as "support vectors". 
+
+One of the benefits of Support Vector Machines is the choice of kernel function to determine the type of decision boundary the algorithm generates to separate the data. In this study, we employ three types of kernels.
+
+The **linear** kernel represents a linear decision boundary.  
+The **polynomial** kernel raises the dot product by a degree to capture non-linear relationships in the data.  
+The **radial** kernel measures the similarity between two points based on their Euclidean distance, introducing non-linearity for complex relationships. 
+
+In our modeling, the **radial** kernel produces the highest performance across all metrics, indicating it is capturing the non-linearity of the relationships. 
+
+### Linear Kernel 
+
+The model takes one hyperparameter, cost, represented as $C$, a regularization parameter that controls the trade-off between achieving a low training error and a low testing error. The cost parameter determines the penalty for misclassification of examples. A smaller $C$ results in a larger-margin that can lead to more misclassifications, while a larger $C$ results in a narrower margin that penalizes misclassifications more heavily but can lead to overfitting. 
+
+Grid search was used to obtain the optimal Cost parameter of $C = 0.01$, a very small value which indicates a larger-margin best reduces variance in the model. The fact that the model is more accurate with a very wide margin is a possible indication that a non-linear decision boundary would better separate the data. 
+
+```{r svm-linear, warning=FALSE, message=FALSE, cache=TRUE}
+# control parameters
+linear.ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = TRUE
+)
+
+# hyperparameter grid
+# linear.grid <- expand.grid(
+#   C = c(0.01, 0.1, 1, 10, 100) # cost
+#   ) 
+linear.grid <- expand.grid(
+  C = 0.01
+)
+
+# train and test model
+svmLinear.model <- svm.deploy(balanced.data, method="linear", ctrl=linear.ctrl, grid=linear.grid)
+```
+
+```{r svmLinearModel}
+svmLinear.model$model
+```
+
+### Polynomial Kernel 
+
+This model takes three hyperparameters: 
+
+1. **Degree** This determines the degree of the polynomial function and the shape of the decision boundary.  
+2. **Scale** A scaling factor applied to the input features. The larger the scale, the more weight is given to the low-frequency variations in the data. A small value indicates the model is sensitive to high-frequency variations.    
+3. **Cost $C$** Regularization parameter controling the width of the margin (see *Linear Kernel*).   
+
+Grid search was used to obtain the optimal hyperparameters:
+
+The final values used for the model were degree = 2, scale = 0.01 and C = 10
+
+This indicates the optimal model uses a quadratic decision boundary with a balanced margin that allows for some misclassifications. The scale value indicates the model is sensitive to high-frequency variations in the data. 
+
+```{r svm-poly, warning=FALSE, message=FALSE, cache=TRUE}
+# control parameters
+poly.ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = TRUE
+)
+
+# grid search
+# poly.grid <- expand.grid(
+#   degree = c(2, 3, 4),        # Degree of the polynomial kernel
+#   scale = c(0.01, 0.1, 1),    # Scale parameter of the polynomial kernel
+#   C = c(0.01, 0.1, 1, 10, 100) # Cost parameter
+# )
+
+# tuning grid
+poly.grid <- expand.grid(
+  degree = 2,
+  scale = 0.01,
+  C = 10
+)
+
+# train and test model
+svmPoly.model <- svm.deploy(balanced.data, method="poly", ctrl=poly.ctrl, grid=poly.grid)
+```
+
+```{r svmPolyModel}
+svmPoly.model$model
+```
+
+
+### Radial Kernel 
+
+This model takes two parameters: 
+
+**sigma** This parameter controls the width of the radial basis function, determining the influence of individual data points on the region around them, which affects how the decision boundary is constructed. The larger the value, the smaller the region in which data points influence those around them. 
+
+**$C$** Cost parameter (see *Linear Kernel*).    
+
+Grid search obtained the optimal hyperparameters sigma = 0.1 and C = 1
+
+A small sigma value here suggests the model performs best with a broad radial basis function in which individual training points influence a larger region of nearby points. This can make the model more robust to variations in the data and improve generalizability.
+
+This model selects a lower $C$ value than the polynomial kernel, which indicates a larger margin work best here which may improve generalizability.  
+
+```{r svm-radial, warning=FALSE, message=FALSE, cache=TRUE}
+# control parameters
+radial.ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = TRUE
+)
+
+# Define the hyperparameter grid for tuning
+# radial.grid <- expand.grid(
+#   C = c(0.01, 0.1, 1, 10),
+#   sigma = c(0.01, 0.1, 1)
+#   )
+radial.grid <- expand.grid(
+  C = 1,
+  sigma = 0.1
+)
+
+# train and test model
+svmRadial.model <- svm.deploy(balanced.data, method="radial", ctrl=radial.ctrl, grid=radial.grid)
+```
+
+```{r svmRadialModel}
+svmRadial.model$model
+```
+## Neural Network {.tabset}   
+
+Neural networks aim to mimic the way human brains learn. They contain interconnected nodes organized in layers. Information flows from an input layer through one or more hidden layers, producing an output, and the network learns by adjusting weights based on the input and output. One of the main challenges in developing neural networks is replicating humans' understanding of biological brain function. There are many different methods to neural networks that try to achieve this. 
+
+Here we attempt several approaches to neural networks to observe which method most accurately models the data.
+
+**Feedforward Neural Network** This method involves a unidirectional flow of information -- information only flows forward from the input layer to the output layer. Between the input and output layers contain one or more hidden layers. Each node in a hidden layer is connected to every node in the previous layer, and each connection has an associated weight. The weights determine the strength of the connections. Each node in each layer is passed through a sigmoid activation function that introduces non-linearity to the model. Weights are adjusted through a process called backpropagation which calculates the error between its predictions and the actual target values using stochastic gradient desecent, and iteratively updates the weights to minimize the error.
+
+**Feedforward Neural Network with PCA** We train the same model incorporating Princial Component Analysis to reduce the number of features in the dataset while preserving its variance. PCA is particularly useful when there are redundancies or multicollinearity among the features. While we observed minimal collinearity, we employ this technique to observe if it improves model performance. 
+
+**Model Averaging Neural Networks** Like it's title, this model averages the predictions of the neural network to improve overall performance.
+
+**Extreme Learning Machine** ELMs simplify the training process by randomly initializing the input-to-hidden layer weights and analytically determining the output weights. Output layer weights are calculated in a single step known as "one-shot learning" using a system of linear equations to find the optimal weights that minimize the error rather than gradient descent. This improves the models speed, as it does not involve an iterative learning process. 
+
+**ReLU Activation Function** A Rectified Linear unit (ReLU) is a commonly used, computationally efficient activation function that allows a model to learn quickly. It is especially well-suited to learning hierarchical representations. It helps mitigate the *vanishing gradient problem* which sigmoid activation functions can be prone to as a result of its behavior near zero and at extremes. This becomes especially pronounced in deep architectures. 
+
+In our modeling we observe that **Model Averaging** approach yields the highest accuracy and sensitivity, while Extreme Learning Machines have the highest specificity and precision. Reducing the dimensionality of the features space using PCA did not improve the model performance. The ReLU activation function took the longest to code but performed the fastest, however the model failed to capture the complexity of the data. 
+
+### Feedforward Neural Network 
+
+This model takes two hyperparameters, 
+
+**Size** represents the number of neurons in the hidden layer. Larger values allow the network to capture more complex relationships in the data but may also increase the risk of overfitting, especially if the network becomes too large relative to the size of the dataset. 
+
+**Decay** a regularization parameter that controls weight decay. Weight decays adds a penalty term to the loss function that discourages weights from becoming too large, which helps prevent overfitting by penalizing overly complex models. The higher the value, the larger the penalty.
+
+Optimal hyperparameters found by grid search were size = 15 and decay = 0.5, indicating an optimal architecture of 15 neurons in the hidden layer(s) and a moderate penalty for large weights. 
+
+
+```{r nnet-train, message=FALSE, warning=FALSE, cache=TRUE}
+# control parameters
+nnet.ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = TRUE
+)
+
+# tune hyperparameters
+# nnet.grid <- expand.grid(
+#   size = c(5, 10, 15),        # Number of nodes in the hidden layer
+#   decay = c(0.01, 0.1, 0.5)  # Weight decay parameter
+# )
+nnet.grid <- expand.grid(
+  size = 15,
+  decay = 0.5
+)
+
+nnet.model <- nn.deploy(balanced.data, "nnet", nnet.ctrl, nnet.grid)
+```
+```{r nnet.model}
+nnet.model$model
+```
+
+
+### Neural Network w/ PCA
+
+This model uses the same hyperparameters as the version without PCA and returned the same optimal values. 
+
+```{r nnpca-train, message=FALSE, warning=FALSE, cache=TRUE}
+# same hyperparameters as neural net
+nnpca.model <- nn.deploy(balanced.data, "pca", nnet.ctrl, nnet.grid)
+```
+```{r nnpca}
+nnpca.model$model
+```
+
+
+### Model Averaging Neural Networks 
+
+This model takes three hyperparameters:
+
+**Size** previously explained
+**Decay** see above
+**Bag** this parameter controls the fraction of data used for bootstrap aggregation. Bagging involves training multiple neural networks on different subsets of the training data and then averaging their predictions. 
+
+Optimal hyperparamter values for the model were size = 5, decay = 0.1 and bag = 0.9
+
+This model prefers fewer neurons (5) in the hidden layer than the previous models which may improve generalizability, but with a lower penalty for larger weights than the previous models, which may lead to overfitting. Each network is trained on 90% of the training data. 
+
+```{r avnnet-train, message=FALSE, warning=FALSE, cache=TRUE}
+# tuning hyperparameters   
+# av.grid <- expand.grid(
+#   size = c(5, 10, 15),        # Number of nodes in the hidden layer
+#   decay = c(0.01, 0.1, 0.5),  # Weight decay parameter
+#   bag = c(0.5, 0.7, 0.9)       # Proportion of the training set used for bagging
+# )
+
+av.grid <- expand.grid(
+  size = 5,        # Number of nodes in the hidden layer
+  decay = 0.1,  # Weight decay parameter
+  bag = 0.9       # Proportion of the training set used for bagging
+)
+
+nnav.model <- nn.deploy(balanced.data, "av", nnet.ctrl, av.grid)
+```
+```{r nnav.model}
+nnav.model$model
+```
+
+
+### Extreme Learning Machine Neural Networks
+
+This model takes two hyperparameters, 
+
+**nhid** represents the **n**umber of **hid**den neurons in the hidden layer(s).    
+**actfun** is the activation function used by the hidden neurons. 
+
+When we ran grid search using lower values for nhid, the optimal hyperparameters chosen for the model were nhid = 10 and actfun = sig. The sigmoid activation function is a logistic function that can model non-linear patterns. However, when we experimented with larger values for nhid, performance improved dramatically. Because the extreme learning machines are fast computationally due to their "one-shot" approach, this did not lead to long processing times. 
+
+```{r elm-train, message=FALSE, warning=FALSE, cache=TRUE}
+# control parameters
+elm.ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = TRUE
+)
+
+# hyperparams
+# elm.grid <- expand.grid(
+#   nhid = c(10, 15, 30, 50),        # Number of nodes in the hidden layer
+#   actfun = c("sig", "sin","radbas")    # Activation function ("sig" for sigmoid, "sin" for sine, "radbas" for radial basis)
+# )
+elm.grid <- expand.grid(
+  nhid = 200,        # Number of nodes in the hidden layer
+  actfun = "sig"    # Activation function
+)
+
+nnelm.model <- nn.deploy(balanced.data, "elm", elm.ctrl, elm.grid)
+```
+
+```{r elm.model}
+nnelm.model$model
+```
+### ReLU Model 
+
+We've trained and tested a variety of neural network models using basic `caret` package functionality, but we'd like to train a model using the ReLU activation function, which requires some additional coding. 
+
+First, we need to create dummy variables for each categorical variable, as the algorithm we'll use cannot handle categorical data. This model also requires us to actually define the architecture of the network we want to construct, the number of epochs, or complete passes through the network, that we'd like the model to perform, as well as the batch size, or number of training examples used for gradient descent in each iteration.
+
+The full code for this construct can be viewed in the ReLU helper function.
+
+The network we defined consisted of three layers:
+
+The first layer has 32 neurons with a ReLU activation function and an input shape determined by the number of features in the training set. 
+
+The second layer has 16 units with a ReLU activation function.    
+
+The third (output) layer uses a sigmoid activation function for the binary classification problem. 
+
+Next we compiled the defined network, passing in the **loss**, **optimizer**, and **metrics** parameters.
+
+The key here is that the network, compiler, and hyperparameters can all be adjusted to produce different results.  
+
+
+```{r relu-dummies, warning=FALSE, message=FALSE, cache=TRUE}
+# encode response variable
+df.relu <- balanced.data |>
+  mutate(heartdisease = ifelse(heartdisease == "yes", 1, 0))
+
+# encode categorical predictors
+dummy.vars <- dummyVars("~.", data = df.relu)
+df.relu <- as.data.frame(predict(dummy.vars, newdata = df.relu))
+```
+
+```{r relu-train, warning=FALSE, message=FALSE, cache=TRUE}
+nnRelu.model <- relu.deploy(df.relu)
+```
+
+```{r relu-model}
+nnRelu.model$model
+```
+# Results    
+
+```{r Results}
+rbind("svmLinear" = svmLinear.model$results,
+      "svmPolynomial" = svmPoly.model$results,
+      "svmRadial" = svmRadial.model$results,
+      "NNetFF" = nnet.model$results,
+      "NNetFFPCA" = nnpca.model$results,
+      "NNetFFAvg" = nnav.model$results,
+      "NNetExtreme" = nnelm.model$results,
+      "NNetReLU" = nnRelu.model$results) |>
+  kable() |>
+  kable_styling()
+```
+
+# Discussion   
+
+In this study, we examined a [Kaggle dataset](https://www.kaggle.com/datasets/fedesoriano/heart-failure-prediction/data) combining data from the [UCI Machine Learning Repository](https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/) containing patient information and whether or not the patient developed heart disease, and compared the performance of Support Vector Machine models with Neural Network models in predicting whether a patient would develop heart disease. The results conclusively demonstrate that the Support Vector Machine radial kernel provides the most accurate predictive model amongst the 8 models compared. Although the overall model accuracy was only 87.9%, the sensitivity of 93.6% indicates that the model correctly identified nearly 94% of the cases in which heart disease was developed. This may or may not be considered accurate enough for production purposes: the medical field is highly regulated, in terms of of diagnosis this model likely isn't accurate enough. The specificity, or true negative rate, of 81.8% would lead to too many false negatives which could delay treatment, increasing the severity of medical issues, and potentially lead to death. A high sensitivity though, could be useful for insurance purposes. If an insurer had access to the patient data in this model, they might use this model to tailor pricing, coverage, or incentives to encourage policy holders to improve their overall health. 
+
+A key highlight of this study is the importance of experimenting with and comparing a number of different models and parameters to find the one that most accurately models the data. In the first pass of modeling, all data was scaled within the training function calls. Under this condition, the Support Vector Machine linear and polynomial kernels yielded identical results. When the numeric features were scaled prior to calling the function, the results diverged, and the polynomial and radial kernel results improved. This study also highlights of experimenting with various types of different models, as demonstrated by the range of results we observed training and testing the 3 Support Vector Machines and 5 Neural Network models. One challenge with respect to Neural Networks is the architecture construction and hyperparameter tuning that I think comes with more experience. The Extreme Learning Machine and ReLU models produced inferior results during early grid search attempts that identified smaller numbers of neurons for each layer in the network. Through experimentation, I was able to produce more accurate models by adjusting the number of neurons. Interestingly though, while neither model outperformed the Support Vector Machines, the Extreme Learning Machine model with fewer neurons had a high specificity, and as the number of neurons increased, the overall performance improved but the specificity deteriorated. This is notable because there may be some applications where a high true negative is desirable in medical screening applications, and some models may have a low overall accuracy but a desirable specificity. 
+
+I was surprised that the Neural Networks didn't outperform the best Support Vector Machine model. I think this is due to a number of factors. First, the relatively small size of the data.  SVMs are particularly effective on smaller datasets whereas Neural Networks strength lies in larger datasets to avoid overfitting. Second, the presence of outliers in the data. SVMs margin maximization approach is robust to outliers, whereas neural networks can be particularly sensitive to outliers and noisy data. Third, SVMs are easier to tune than Neural Networks; the poorest performing Neural Network (the ReLU) requires finely tuned networks that can be time intensive to develop and extends beyond the scope of this assignment, whereas grid search for the SVMs quickly identified optimal hyperparameters that achieved superior performance. Future study will focus on understanding the complexity of neural network architecture and developing robust hyperparameter tuning strategies in order to produce better (ie, more accurate) models.  
+
+References:    
+https://topepo.github.io/caret/model-training-and-tuning.html.  
+Chollet, F., & others. (2015). Keras. GitHub. Retrieved from https://github.com/fchollet/keras.  
+Chollet, F. (2017). Deep learning with python. Manning Publications.   
+
+
+
